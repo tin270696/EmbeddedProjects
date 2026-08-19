@@ -18,6 +18,10 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f103xb.h"
+#include "stm32f1xx_hal_gpio.h"
+#include "stm32f1xx_hal_tim.h"
+#include <stdint.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -32,6 +36,9 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define BUTTON_DEBOUNCE_TIME 50
+#define LED_PERIOD 500
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,10 +51,10 @@ TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 
-#define BUTTON_DEBOUNCE_TIME 50
-
 volatile uint8_t button_pressed = 0;
 uint32_t last_button_tick = 0;
+
+volatile uint32_t timer_tick  = 0;
 
 /* USER CODE END PV */
 
@@ -55,8 +62,9 @@ uint32_t last_button_tick = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
-/* USER CODE BEGIN PFP */
 
+/* USER CODE BEGIN PFP */
+void LED_Task(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -95,7 +103,7 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_TIM_Base_Start_IT(&htim2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -105,6 +113,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    LED_Task();
+
     if (button_pressed) {
       button_pressed = 0;
       HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
@@ -247,6 +257,22 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     }
   }
 }
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+  if (htim->Instance == TIM2) {
+    timer_tick++;
+  }
+}
+
+void LED_Task(void) {
+  static uint32_t last_tick = 0;
+
+  if((timer_tick - last_tick) >= LED_PERIOD) {
+    last_tick += LED_PERIOD;
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+  }
+}
+
 /* USER CODE END 4 */
 
 /**
