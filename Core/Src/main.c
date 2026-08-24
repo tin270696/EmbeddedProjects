@@ -41,10 +41,16 @@ typedef enum {
 typedef void (*CommandHandler_t)(char *argument);
 
 typedef struct {
-  const char* name;
+  const char *name;
   CommandHandler_t handler;
   uint8_t require_argument;
 } Command_t;
+
+typedef struct {
+  char *command;
+  char *argument;
+  char *extra_argument;
+} ParsedCommand_t;
 
 /* USER CODE END PTD */
 
@@ -54,9 +60,8 @@ typedef struct {
 #define BUTTON_DEBOUNCE_TIME 50
 #define LED_PERIOD 500
 #define HEARTBEAT_PERIOD 1000
-#define RX_BUFFER_SIZE 32
 #define UART_RX_RING_SIZE 64
-#define COMMAND_BUFFER_SIZE 32
+#define COMMAND_BUFFER_SIZE 64
 #define UART_TX_TIMEOUT 100
 
 /* USER CODE END PD */
@@ -79,12 +84,11 @@ uint32_t last_button_tick = 0;
 volatile uint32_t timer_tick  = 0;
 
 uint8_t rx_data;
-uint8_t rx_buffer[RX_BUFFER_SIZE];
-uint8_t command_buffer[RX_BUFFER_SIZE];
+uint8_t command_buffer[COMMAND_BUFFER_SIZE];
 uint8_t uart_rx_ring[UART_RX_RING_SIZE];
 volatile uint8_t uart_rx_head = 0;
 volatile uint8_t uart_rx_tail = 0;
-volatile uint8_t rx_index = 0;
+volatile uint8_t uart_rx_buffer_overflow = 0;
 volatile uint8_t command_ready = 0;
 
 LED_Mode_t led_mode = LED_MODE_BLINK;
@@ -103,8 +107,10 @@ void Heartbeat_Task(void);
 void Command_Task(void);
 
 uint8_t UART_RingBuffer_Put(uint8_t data);
-uint8_t UART_RingBuffer_Get(uint8_t data)
-void UART_SendString(const char* str);
+uint8_t UART_RingBuffer_Get(uint8_t *data);
+void UART_Error_BufferOverflow(void);
+void UART_SendString(const char *str);
+uint8_t Command_Parse(char *buffer, ParsedCommand_t *res);
 void Command_FindAndExecute(char *command, char *argument, char *extra_argument);
 
 /* USER CODE END PFP */
@@ -160,6 +166,7 @@ int main(void)
     LED_Task();
     Heartbeat_Task();
     Command_Task();
+    UART_Error_BufferOverflow();
 
     if (button_pressed) {
       button_pressed = 0;
@@ -393,36 +400,35 @@ void Heartbeat_Task(void) {
 }
 
 void Command_Task(void) {
+  uint8_t data;
+  static uint8_t command_index = 0;
+
+  while(UART_RingBuffer_Get(&data)) {
+    if (data == '\r') continue;
+
+    if (data == '\n') {
+      command_buffer[command_index] = '\0';
+      command_ready = 1;
+      command_index = 0;
+      break;
+    }
+
+    if (command_index < COMMAND_BUFFER_SIZE - 1) {
+      command_buffer[command_index++] = data;
+    }
+  }
+
   if (command_ready) {
     command_ready = 0;
 
-    char* command;
-    char* argument;
-    char* extra_argument;
+    ParsedCommand_t parsed;
 
-    command = strtok((char*)command_buffer, " ");
-    argument = strtok(NULL, " ");
-    extra_argument = strtok(NULL, " ");
-
-    if (command == NULL) {
+    if (!Command_Parse((char*)command_buffer, &parsed)) {
       UART_SendString("ERROR: UNKNOWN COMMAND\r\n");
       return;
     }
 
-    if (strcmp(command, "LED") == 0) {
-      if (extra_argument != NULL) {
-        UART_SendString("ERROR: TOO MANY ARGUMENTS\r\n");
-        return;
-      }
-    }
-    else {
-      if(argument != NULL) {
-        UART_SendString("ERROR: TOO MANY ARGUMENTS\r\n");
-        return;
-      }
-    }
-
-    Command_FindAndExecute(command, argument, extra_argument);
+    Command_FindAndExecute(parsed.command, parsed.argument, parsed.extra_argument);
   }
 }
 
@@ -455,24 +461,20 @@ uint8_t UART_RingBuffer_Get(uint8_t *data) {
   return 1;
 }
 
+void UART_Error_BufferOverflow(void) {
+  if (uart_rx_buffer_overflow) {
+    uart_rx_buffer_overflow = 0;
+    UART_SendString("ERROR: RX BUFFER OVERFLOW\r\n");
+  }
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART1) {
-    if (rx_data == '\n') {
-      rx_buffer[rx_index] = '\0';
-
-      if (!command_ready) {
-        strcpy((char *)command_buffer, (char *)rx_buffer);
-        command_ready = 1;
-      }
-
-      rx_index = 0;
+    
+    if (!UART_RingBuffer_Put(rx_data)) {
+      uart_rx_buffer_overflow = 1;
     }
-    else if (rx_data != '\r') {
-      if (rx_index < RX_BUFFER_SIZE - 1) {
-        rx_buffer[rx_index] = rx_data;
-        rx_index++;
-      }
-    }
+
     HAL_UART_Receive_IT(&huart1, &rx_data, 1);
   }
 }
@@ -547,6 +549,7 @@ void Help_Handler(char *argument) {
         "LED OFF\r\n"
         "LED TOGGLE\r\n"
         "LED BLINK\r\n"
+        "LED RESET\r\n"
         "LED STATUS\r\n"
         "HELP\r\n"
         "VERSION\r\n"
@@ -568,6 +571,76 @@ Command_t command_table[] =
   {"VERSION", Version_Handler, 0}
 };
 
+uint8_t Command_Parse(char *buffer, ParsedCommand_t *res) {
+  res->command = NULL;
+  res->argument = NULL;
+  res->extra_argument = NULL;
+
+  char *p = buffer;
+
+  while (*p == ' ') {
+    p++;
+  }
+
+  // Nếu chuỗi rỗng trả về 0
+  if (*p == '\0') {
+    return 0;
+  }
+
+  char *command_start = p;
+
+  while (*p != ' ' && *p != '\0') {
+    p++;
+  }
+
+  if (*p == ' ') {
+    *p = '\0';
+    res->command = command_start;
+    p++;
+
+    while (*p == ' ') {
+      p++;
+    }
+
+    if (*p == '\0') {
+      return 1;
+    }
+
+    char *argument_start = p;
+    while (*p != ' ' && *p != '\0') {
+      p++;
+    }
+
+    if (*p == ' ') {
+      *p = '\0';
+      res->argument = argument_start;
+      p++;
+
+      while (*p == ' ') {
+        p++;
+      }
+
+      if (*p == '\0') {
+        return 1;
+      }
+
+      char *extra_argument_start = p;
+      while (*p != ' ' && *p != '\0') {
+        p++;
+      }
+      
+      res->extra_argument = extra_argument_start;
+      return 1;
+    }
+
+    res->argument = argument_start;
+    return 1;
+  }
+
+  res->command = command_start;
+  return 1;
+}
+
 void Command_FindAndExecute(char *command, char *argument, char *extra_argument) {
   if (command == NULL) {
     UART_SendString("ERROR: UNKNOWN COMMAND\r\n");
@@ -579,6 +652,11 @@ void Command_FindAndExecute(char *command, char *argument, char *extra_argument)
   for(size_t i = 0; i < command_cnt; i++) {
     if (strcmp(command_table[i].name, command) == 0) {
       if (command_table[i].require_argument) {
+        if (argument == NULL) {
+          UART_SendString("ERROR: MISSING ARGUMENT\r\n");
+          return;
+        }
+
         if (extra_argument != NULL) {
           UART_SendString("ERROR: TOO MANY ARGUMENTS\r\n");
           return;
