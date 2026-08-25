@@ -38,6 +38,11 @@ typedef enum {
   LED_MODE_BLINK
 } LED_Mode_t;
 
+typedef enum {
+  COMMAND_STATE_NORMAL,
+  COMMAND_STATE_DISCARD
+} CommandState_t;
+
 typedef void (*CommandHandler_t)(char *argument);
 
 typedef struct {
@@ -88,8 +93,11 @@ uint8_t command_buffer[COMMAND_BUFFER_SIZE];
 uint8_t uart_rx_ring[UART_RX_RING_SIZE];
 volatile uint8_t uart_rx_head = 0;
 volatile uint8_t uart_rx_tail = 0;
-volatile uint8_t uart_rx_buffer_overflow = 0;
+volatile uint8_t uart_rx_overflow = 0;
+volatile uint8_t command_overflow = 0;
 volatile uint8_t command_ready = 0;
+
+static CommandState_t command_state = COMMAND_STATE_NORMAL;
 
 LED_Mode_t led_mode = LED_MODE_BLINK;
 
@@ -109,6 +117,7 @@ void Command_Task(void);
 uint8_t UART_RingBuffer_Put(uint8_t data);
 uint8_t UART_RingBuffer_Get(uint8_t *data);
 void UART_Error_BufferOverflow(void);
+void Command_Error_BufferOverflow(void);
 void UART_SendString(const char *str);
 uint8_t Command_Parse(char *buffer, ParsedCommand_t *res);
 void Command_FindAndExecute(char *command, char *argument, char *extra_argument);
@@ -167,6 +176,7 @@ int main(void)
     Heartbeat_Task();
     Command_Task();
     UART_Error_BufferOverflow();
+    Command_Error_BufferOverflow();
 
     if (button_pressed) {
       button_pressed = 0;
@@ -403,21 +413,6 @@ void Command_Task(void) {
   uint8_t data;
   static uint8_t command_index = 0;
 
-  while(UART_RingBuffer_Get(&data)) {
-    if (data == '\r') continue;
-
-    if (data == '\n') {
-      command_buffer[command_index] = '\0';
-      command_ready = 1;
-      command_index = 0;
-      break;
-    }
-
-    if (command_index < COMMAND_BUFFER_SIZE - 1) {
-      command_buffer[command_index++] = data;
-    }
-  }
-
   if (command_ready) {
     command_ready = 0;
 
@@ -429,6 +424,38 @@ void Command_Task(void) {
     }
 
     Command_FindAndExecute(parsed.command, parsed.argument, parsed.extra_argument);
+  }
+
+  if (uart_rx_overflow) {
+    command_state = COMMAND_STATE_DISCARD;
+    command_index = 0;
+  }
+
+  while(UART_RingBuffer_Get(&data)) {
+    if (command_state == COMMAND_STATE_DISCARD) {
+      if (data == '\n') {
+        command_state = COMMAND_STATE_NORMAL;
+      }
+      continue;
+    }
+
+    if (data == '\r') continue;
+
+    if (data == '\n') {
+      command_buffer[command_index] = '\0';
+      command_ready = 1;
+      command_index = 0;
+      break;
+    }
+
+    if (command_index >= COMMAND_BUFFER_SIZE - 1) {
+      command_overflow = 1;
+      command_state = COMMAND_STATE_DISCARD;
+      command_index = 0;
+      continue;
+    }
+    
+    command_buffer[command_index++] = data;
   }
 }
 
@@ -462,9 +489,16 @@ uint8_t UART_RingBuffer_Get(uint8_t *data) {
 }
 
 void UART_Error_BufferOverflow(void) {
-  if (uart_rx_buffer_overflow) {
-    uart_rx_buffer_overflow = 0;
+  if (uart_rx_overflow) {
+    uart_rx_overflow = 0;
     UART_SendString("ERROR: RX BUFFER OVERFLOW\r\n");
+  }
+}
+
+void Command_Error_BufferOverflow(void) {
+  if (command_overflow) {
+    command_overflow = 0;
+    UART_SendString("ERROR: COMMAND TOO LONG\r\n");
   }
 }
 
@@ -472,7 +506,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART1) {
     
     if (!UART_RingBuffer_Put(rx_data)) {
-      uart_rx_buffer_overflow = 1;
+      uart_rx_overflow = 1;
     }
 
     HAL_UART_Receive_IT(&huart1, &rx_data, 1);
